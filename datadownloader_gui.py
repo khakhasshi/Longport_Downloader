@@ -1,7 +1,12 @@
 # LongPort数据下载器 - PyQt6 GUI版本
 import sys
 import os
+import json
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
+
+# 配置文件存放于用户主目录，避免泄露到版本库
+CONFIG_FILE = os.path.join(os.path.expanduser('~'), '.longport_downloader.json')
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QComboBox, QDateEdit, QFileDialog, QTextEdit,
@@ -53,7 +58,23 @@ class DataDownloaderThread(QThread):
                 
                 # 保存文件
                 df = pd.DataFrame(clean_data)
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                # LongPort API 返回的时间戳以 UTC+8（香港时间 HKT）为基准
+                raw_ts = pd.to_datetime(df['timestamp'])
+                if self.is_us_stock(self.symbol):
+                    # 美股：HKT → 美东时间（自动处理 EST/EDT 夏令时切换）
+                    hkt_tz = ZoneInfo('Asia/Hong_Kong')
+                    ny_tz  = ZoneInfo('America/New_York')
+                    if raw_ts.dt.tz is None:
+                        df['timestamp'] = raw_ts.dt.tz_localize(hkt_tz).dt.tz_convert(ny_tz)
+                    else:
+                        df['timestamp'] = raw_ts.dt.tz_convert(ny_tz)
+                    self.log_updated.emit("✓ 已将时间戳从 HKT (UTC+8) 转换为美东时间 (America/New_York)")
+                else:
+                    # 非美股：保持 HKT
+                    if raw_ts.dt.tz is None:
+                        df['timestamp'] = raw_ts.dt.tz_localize(ZoneInfo('Asia/Hong_Kong'))
+                    else:
+                        df['timestamp'] = raw_ts
                 
                 # 获取Period的字符串表示
                 period_str = str(self.period).split('.')[-1] if '.' in str(self.period) else str(self.period)
@@ -135,12 +156,18 @@ class DataDownloaderThread(QThread):
         
         return all_data
     
+    @staticmethod
+    def is_us_stock(symbol: str) -> bool:
+        """判断是否为美股（以 .US 结尾）"""
+        return symbol.upper().endswith('.US')
+
     def remove_duplicates(self, data):
         """去除重复数据"""
         if not data:
             return data
         
         df = pd.DataFrame(data)
+        # 去重仅需比较原始值，不强制时区，避免干扰后续转换
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         
         original_count = len(df)
@@ -160,6 +187,7 @@ class DataDownloaderGUI(QMainWindow):
         super().__init__()
         self.download_thread = None
         self.init_ui()
+        self.load_config()
         
     def init_ui(self):
         self.setWindowTitle("LongPort 股票数据下载器")
@@ -199,6 +227,14 @@ class DataDownloaderGUI(QMainWindow):
         self.access_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         api_layout.addRow("Access Token:", self.access_token_edit)
         
+        # 保存配置按钮（手动）
+        save_cfg_layout = QHBoxLayout()
+        save_cfg_layout.addStretch()
+        self.save_config_button = QPushButton("保存 API 配置")
+        self.save_config_button.clicked.connect(self._on_save_config_clicked)
+        save_cfg_layout.addWidget(self.save_config_button)
+        api_layout.addRow("", save_cfg_layout)
+
         api_group.setLayout(api_layout)
         main_layout.addWidget(api_group)
         
@@ -295,6 +331,67 @@ class DataDownloaderGUI(QMainWindow):
         log_group.setLayout(log_layout)
         main_layout.addWidget(log_group)
         
+    # ──────────────── 配置持久化 ────────────────
+
+    def load_config(self):
+        """从 JSON 文件加载持久化配置"""
+        if not os.path.exists(CONFIG_FILE):
+            return
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+
+            if cfg.get('app_key'):
+                self.app_key_edit.setText(cfg['app_key'])
+            if cfg.get('app_secret'):
+                self.app_secret_edit.setText(cfg['app_secret'])
+            if cfg.get('access_token'):
+                self.access_token_edit.setText(cfg['access_token'])
+            if cfg.get('symbol'):
+                self.symbol_edit.setText(cfg['symbol'])
+            if cfg.get('period_index') is not None:
+                idx = cfg['period_index']
+                if 0 <= idx < self.period_combo.count():
+                    self.period_combo.setCurrentIndex(idx)
+            if cfg.get('start_date'):
+                d = QDate.fromString(cfg['start_date'], 'yyyy-MM-dd')
+                if d.isValid():
+                    self.start_date_edit.setDate(d)
+            if cfg.get('end_date'):
+                d = QDate.fromString(cfg['end_date'], 'yyyy-MM-dd')
+                if d.isValid():
+                    self.end_date_edit.setDate(d)
+            if cfg.get('save_path') and os.path.isdir(cfg['save_path']):
+                self.save_path_edit.setText(cfg['save_path'])
+
+        except Exception as e:
+            self.add_log(f"⚠ 加载配置失败: {e}")
+
+    def save_config(self):
+        """将当前所有设置持久化到 JSON 文件"""
+        cfg = {
+            'app_key':      self.app_key_edit.text(),
+            'app_secret':   self.app_secret_edit.text(),
+            'access_token': self.access_token_edit.text(),
+            'symbol':       self.symbol_edit.text(),
+            'period_index': self.period_combo.currentIndex(),
+            'start_date':   self.start_date_edit.date().toString('yyyy-MM-dd'),
+            'end_date':     self.end_date_edit.date().toString('yyyy-MM-dd'),
+            'save_path':    self.save_path_edit.text(),
+        }
+        try:
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.add_log(f"⚠ 保存配置失败: {e}")
+
+    def _on_save_config_clicked(self):
+        """手动点击"保存 API 配置"按钮"""
+        self.save_config()
+        self.add_log(f"✓ 配置已保存到 {CONFIG_FILE}")
+
+    # ──────────────── 文件夹浏览 ────────────────
+
     def browse_folder(self):
         """选择保存文件夹"""
         folder = QFileDialog.getExistingDirectory(self, "选择保存文件夹", self.save_path_edit.text())
@@ -324,6 +421,7 @@ class DataDownloaderGUI(QMainWindow):
                 end_date
             )
             
+            self.save_config()  # 连接成功后自动保存凭证
             QMessageBox.information(self, "连接测试", "✓ API连接测试成功!")
             self.add_log("✓ API连接测试成功!")
             
@@ -361,7 +459,9 @@ class DataDownloaderGUI(QMainWindow):
         symbol = self.symbol_edit.text()
         period = self.period_combo.currentData()
         save_path = self.save_path_edit.text()
-        
+
+        self.save_config()  # 开始下载前自动保存所有设置
+
         # 创建并启动下载线程
         self.download_thread = DataDownloaderThread(
             config_data, symbol, start_date, end_date, period, save_path
