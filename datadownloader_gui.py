@@ -75,6 +75,12 @@ class DataDownloaderThread(QThread):
                         df['timestamp'] = raw_ts.dt.tz_localize(ZoneInfo('Asia/Hong_Kong'))
                     else:
                         df['timestamp'] = raw_ts
+
+                # 去掉时间戳中的时区偏移后缀（如 -05:00），保留本地时间
+                df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+
+                # 去掉 trade_session 的前缀"TradeSession."，只保留名称
+                df['trade_session'] = df['trade_session'].str.replace(r'^TradeSession\.', '', regex=True)
                 
                 # 获取Period的字符串表示
                 period_str = str(self.period).split('.')[-1] if '.' in str(self.period) else str(self.period)
