@@ -110,58 +110,123 @@ class DataDownloaderThread(QThread):
             self.log_updated.emit(error_msg)
             self.download_finished.emit(False, error_msg)
     
+    # ── 每种 Period 对应"覆盖约1000根K线所需的日历天数" ──
+    # 分钟级别用逐天模式，日线及以上用分段批量模式
+    _BULK_CHUNK_DAYS = {
+        Period.Day:   1000,   # ~2.7年/段
+        Period.Week:  7000,   # ~1000周/段
+        Period.Month: 32000,  # ~1000个月/段，几乎一次搞定
+    }
+
+    @staticmethod
+    def is_intraday_period(period) -> bool:
+        """分钟级别 K 线返回 True，日线及以上返回 False"""
+        return period not in (Period.Day, Period.Week, Period.Month)
+
+    @staticmethod
+    def _parse_candle(candle) -> dict:
+        """将 API candle 对象转为字典"""
+        return {
+            'timestamp':     candle.timestamp,
+            'open':          candle.open,
+            'high':          candle.high,
+            'low':           candle.low,
+            'close':         candle.close,
+            'volume':        candle.volume,
+            'turnover':      candle.turnover,
+            'trade_session': str(candle.trade_session),
+        }
+
     def download_data(self):
-        """下载数据"""
+        """下载入口：分钟级逐日请求，日线及以上分段批量请求"""
+        if self.is_intraday_period(self.period):
+            return self._download_intraday()
+        else:
+            return self._download_bulk()
+
+    def _download_intraday(self):
+        """分钟级：逐日请求（每天数据量远低于1000根）"""
         all_data = []
         current_date = self.start_date
         total_days = (self.end_date - self.start_date).days + 1
         current_day = 0
-        
+
         while current_date <= self.end_date:
             current_day += 1
             next_date = current_date + timedelta(days=1)
-            
+
             try:
-                self.progress_updated.emit(current_day, total_days, f"正在下载 {current_date} 的数据...")
-                
-                # 获取单天数据
+                self.progress_updated.emit(current_day, total_days,
+                                           f"正在下载 {current_date} 的数据...")
                 resp = self.ctx.history_candlesticks_by_date(
-                    self.symbol,
-                    self.period,
-                    AdjustType.NoAdjust,
-                    current_date,
-                    next_date
+                    self.symbol, self.period, AdjustType.NoAdjust,
+                    current_date, next_date
                 )
-                
-                if resp and len(resp) > 0:
-                    day_data = []
-                    for candle in resp:
-                        day_data.append({
-                            'timestamp': candle.timestamp,
-                            'open': candle.open,
-                            'high': candle.high,
-                            'low': candle.low,
-                            'close': candle.close,
-                            'volume': candle.volume,
-                            'turnover': candle.turnover,
-                            'trade_session': str(candle.trade_session)
-                        })
-                    
-                    all_data.extend(day_data)
-                    self.log_updated.emit(f"    ✓ {current_date} 成功获取 {len(resp)} 条记录")
+                if resp:
+                    all_data.extend(self._parse_candle(c) for c in resp)
+                    self.log_updated.emit(
+                        f"    ✓ {current_date} 成功获取 {len(resp)} 条记录")
                 else:
                     self.log_updated.emit(f"    ⚠ {current_date} 无数据")
-                    
+
             except Exception as e:
-                self.log_updated.emit(f"    ✗ 获取 {current_date} 数据失败: {str(e)}")
+                self.log_updated.emit(
+                    f"    ✗ 获取 {current_date} 数据失败: {str(e)}")
                 if "out of minute kline begin date" in str(e):
-                    self.log_updated.emit("    ⚠ 该日期超出可用数据范围，继续下一天...")
-            
+                    self.log_updated.emit(
+                        "    ⚠ 该日期超出可用数据范围，继续下一天...")
+
             time.sleep(0.3)
             current_date = next_date
-        
+
         return all_data
-    
+
+    def _download_bulk(self):
+        """日线及以上：按段批量请求，每段最多覆盖 ~1000 根K线"""
+        all_data = []
+        chunk_days = self._BULK_CHUNK_DAYS.get(self.period, 1000)
+
+        # 计算分段列表
+        segments = []
+        seg_start = self.start_date
+        while seg_start <= self.end_date:
+            seg_end = min(seg_start + timedelta(days=chunk_days - 1), self.end_date)
+            segments.append((seg_start, seg_end))
+            seg_start = seg_end + timedelta(days=1)
+
+        total_segs = len(segments)
+        period_str = str(self.period).split('.')[-1]
+        self.log_updated.emit(
+            f"批量模式：共分 {total_segs} 段下载（每段最多覆盖 {chunk_days} 天）")
+
+        for idx, (seg_start, seg_end) in enumerate(segments, 1):
+            try:
+                self.progress_updated.emit(idx, total_segs,
+                    f"正在下载第 {idx}/{total_segs} 段 "
+                    f"({seg_start} ~ {seg_end})...")
+
+                # API end_date 需要多加一天才能包含 seg_end 当天
+                resp = self.ctx.history_candlesticks_by_date(
+                    self.symbol, self.period, AdjustType.NoAdjust,
+                    seg_start, seg_end + timedelta(days=1)
+                )
+                if resp:
+                    all_data.extend(self._parse_candle(c) for c in resp)
+                    self.log_updated.emit(
+                        f"    ✓ 段 {idx}: {seg_start} ~ {seg_end} "
+                        f"成功获取 {len(resp)} 条记录")
+                else:
+                    self.log_updated.emit(
+                        f"    ⚠ 段 {idx}: {seg_start} ~ {seg_end} 无数据")
+
+            except Exception as e:
+                self.log_updated.emit(
+                    f"    ✗ 段 {idx}: {seg_start} ~ {seg_end} 失败: {str(e)}")
+
+            time.sleep(0.3)
+
+        return all_data
+
     @staticmethod
     def is_us_stock(symbol: str) -> bool:
         """判断是否为美股（以 .US 结尾）"""
